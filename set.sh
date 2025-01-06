@@ -1,0 +1,1 @@
+firebase functions:config:set openai.key="..."
