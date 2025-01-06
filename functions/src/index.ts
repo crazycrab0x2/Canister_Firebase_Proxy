@@ -2,13 +2,13 @@ import * as express from "express";
 import * as cors from "cors";
 import * as functions from "firebase-functions";
 
-import {initializeApp} from "firebase-admin/app";
+import * as admin from "firebase-admin";
 
-initializeApp();
+admin.initializeApp();
 
 const app = express();
 app.use(express.json());
-app.use(cors({origin: true}));
+app.use(cors({ origin: true }));
 
 const runtimeOpts = {
   timeoutSeconds: 300,
@@ -16,69 +16,74 @@ const runtimeOpts = {
 };
 
 const processingCache = new Map(); // Shared in-memory cache
-const promptCache = new Map(); // Shared in-memory cache
+const requestCache = new Map(); // Shared in-memory cache
+const openaiKey: string = functions.config().openai.key;
+// console.log("openAI-KEY", openaiKey)
 
-const openaiKey: string = "";
 const apiUrl = "https://api.openai.com";
 
 interface ImageGenerationResponse {
-    "created": number,
-    "data": [
-      {
-        "url": string,
-        "revised_prompt": string
-      }
-    ]
-  }
+  created: number;
+  data: [
+    {
+      url: string;
+      revised_prompt: string;
+    }
+  ];
+}
 
 interface ChatCompletionResponse {
-    "id": string,
-    "object": string,
-    "created": number,
-    "model": string,
-    "system_fingerprint": string,
-    "choices": [{
-        "index": number,
-        "message": {
-            "role": string,
-            "content": string,
-        },
-        "logprobs": object,
-        "finish_reason": string
-    }],
-    "usage": {
-        "prompt_tokens": number,
-        "completion_tokens": number,
-        "total_tokens": number,
-        "completion_tokens_details": {
-            "reasoning_tokens": number,
-            "accepted_prediction_tokens": number,
-            "rejected_prediction_tokens": number
-        }
+  id: string;
+  object: string;
+  created: number;
+  model: string;
+  system_fingerprint: string;
+  choices: [
+    {
+      index: number;
+      message: {
+        role: string;
+        content: string;
+      };
+      logprobs: object;
+      finish_reason: string;
     }
+  ];
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    completion_tokens_details: {
+      reasoning_tokens: number;
+      accepted_prediction_tokens: number;
+      rejected_prediction_tokens: number;
+    };
+  };
 }
 
 //chat generation
 const fetchOpenAI = async ({
   req,
   res,
-  api
+  api,
 }: {
   req: express.Request;
   res: express.Response;
   api: string;
 }) => {
   try {
-    const response = await callOpenAI({req, api});
-    console.log("gptResponse", response)
+    let response = await callOpenAI({ req, api });
+    // response = response.replace(/\n/g, "<br/>");
+    console.log("response", response);
     res.set("Cache-Control", "no-cache");
-    res.json(response);
+    res.status(200).send(response);
   } catch (err: Error | unknown) {
     res.status(500).send(err);
+    console.log("error - ", err)
   }
-}
+};
 
-//call OpenAI
+//call OpenAI for chat completions
 const callOpenAI = async ({
   req,
   api,
@@ -86,115 +91,84 @@ const callOpenAI = async ({
   req: express.Request;
   api: string;
 }): Promise<string> => {
-    const prompt = req.body.prompt;
+  const key = req.body.key;
+  const request = req.body.request
 
-    console.log("prompt", prompt)
+  if (key) {
+    if (requestCache.has(request)) {
+      const oldDate = requestCache.get(request);
 
-    const date = req.body.date;
-
-    if(date) {
-        if(promptCache.has(prompt)) {
-            const oldDate = promptCache.get(prompt);
-
-            if(oldDate == date) {
-                const ongoingPromise = processingCache.get(prompt);
-                const result = await ongoingPromise;
-                return  result;
-            } 
-            else {
-                const processingPromise = processRequest(req, api);
-                promptCache.set(prompt, date);
-                processingCache.set(prompt, processingPromise);
-            
-                const result:any = await processingPromise;
-
-                return result;
-            }
-        }
-
-        const processingPromise = processRequest(req, api);
-        promptCache.set(prompt, date);
-        processingCache.set(prompt, processingPromise);
-    
-        const result:any = await processingPromise;
-    
+      if (oldDate == key) {
+        const ongoingPromise = processingCache.get(request);
+        const result = await ongoingPromise;
         return result;
-    } else {
-        return "error";
+      } else {
+        const processingPromise = processRequest(req, api);
+        requestCache.set(request, key);
+        processingCache.set(request, processingPromise);
+
+        const result: any = await processingPromise;
+
+        return result;
+      }
     }
-}
 
-async function processRequest(req: express.Request, api: string) {
-    const prompt = req.body.prompt;
-    // const date = req.body.date;
-    if(api == "completions") {
-        const body = {
-            "model": "gpt-4o",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        }
+    const processingPromise = processRequest(req, api);
+    requestCache.set(request, key);
+    processingCache.set(request, processingPromise);
 
-        const headers = {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${openaiKey}`,
-        };
+    const result: any = await processingPromise;
 
-        const response = await fetch(`${apiUrl}/v1/chat/${api}`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-        });
-
-        if (!response.ok) {
-            throw new Error(
-            `Response not ok. Status ${response.status}. Message ${response.statusText}.`,
-            );
-        }
-        const result: ChatCompletionResponse = await response.json(); 
-        return result.choices[0].message.content;
-    }
-    else {
-        const body = {
-            "model": "dall-e-3",
-            "prompt": prompt,
-            "n": 1
-        }
-
-        const headers = {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${openaiKey}`,
-        };
-
-        const response = await fetch(`${apiUrl}/v1/images/${api}`, {
-            method: "POST",
-            headers,
-            body: JSON.stringify(body),
-        });
-
-        if (!response.ok) {
-            throw new Error(
-            `Response not ok. Status ${response.status}. Message ${response.statusText}.`,
-            );
-        }
-        const result: ImageGenerationResponse = await response.json(); 
-        return result.data[0].url;
-    }
+    return result;
+  } else {
+    return "error";
+  }
 };
 
-app.post("/chat", async (req:any, res:any) => {
-  await fetchOpenAI({req, res, api: "completions"});
+async function processRequest(req: express.Request, api: string) {
+  const request = req.body.request as string;
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${openaiKey}`,
+  };
+
+  if (api == "completions") {
+    const response = await fetch(`${apiUrl}/v1/chat/${api}`, {
+      method: "POST",
+      headers,
+      body: request,
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Response not ok. Status ${response.status}. Message ${response.statusText}.`
+      );
+    }
+    const result: ChatCompletionResponse = await response.json();
+    return result.choices[0].message.content;
+  } else {
+    const response = await fetch(`${apiUrl}/v1/images/${api}`, {
+      method: "POST",
+      headers,
+      body: request,
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Response not ok. Status ${response.status}. Message ${response.statusText}.`
+      );
+    }
+    const result: ImageGenerationResponse = await response.json();
+    return result.data[0].url;
+  }
+}
+
+app.post("/chat", async (req: any, res: any) => {
+  await fetchOpenAI({ req, res, api: "completions" });
 });
 
-app.post("/image", async (req:any, res:any) => {
-await fetchOpenAI({req, res, api: "generations"});
+app.post("/image", async (req: any, res: any) => {
+  await fetchOpenAI({ req, res, api: "generations" });
 });
 
 exports.chatgpt = functions.runWith(runtimeOpts).https.onRequest(app);
